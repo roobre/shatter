@@ -2,18 +2,20 @@ package stats
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/exp/slices"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
 
 const (
-	minSampleBytes = 1024
-	// Requests below minSampleBytes will not be counted UNLESS they took more than minDurationForMinBytes
-	minDurationForMinBytes = 1 * time.Second
-	minSampleDuration      = 50 * time.Millisecond
-	maxSamples             = 20.0
+	// Requests that transfer less than minSampleBytes AND take less than maxDurationForMinBytes will not
+	// be taken into account for ranking.
+	minSampleBytes         = 512 << 10 // 512KiB
+	maxDurationForMinBytes = 1 * time.Second
+
+	maxSamples = 15.0
 )
 
 type Stats struct {
@@ -24,7 +26,7 @@ type Stats struct {
 }
 
 type Config struct {
-	NumWorkers    int `yaml:"-"`
+	NumWorkers    int `yaml:"workers"`
 	NumTopWorkers int `yaml:"topWorkers"`
 
 	GoodThroughputMiBs float64 `yaml:"goodThroughputMiBs"`
@@ -32,7 +34,7 @@ type Config struct {
 
 func (c Config) WithDefaults() Config {
 	if c.NumWorkers == 0 {
-		c.NumWorkers = 8
+		c.NumWorkers = 12
 	}
 
 	if c.NumTopWorkers == 0 {
@@ -40,14 +42,14 @@ func (c Config) WithDefaults() Config {
 	}
 
 	if c.GoodThroughputMiBs == 0 {
-		c.GoodThroughputMiBs = 10
+		c.GoodThroughputMiBs = 2
 	}
 
 	return c
 }
 
 type Sample struct {
-	Bytes    int64
+	Bytes    uint64
 	Duration time.Duration
 }
 
@@ -84,13 +86,14 @@ func (s *Stats) Remove(name string) {
 }
 
 func (s *Stats) Update(name string, sample Sample) {
-	if sample.Bytes < minSampleBytes && sample.Duration < minDurationForMinBytes {
-		log.Infof("Dropping sample for %s, not enough bytes to measure (%d)", name, sample.Bytes)
-		return
-	}
-
-	if sample.Duration < minSampleDuration {
-		log.Infof("Dropping sample for %s, not transaction too short to measure (%v)", name, sample.Duration)
+	// Samples for very few bytes are discarded, as the delta is too small to produce a meaningful throughput
+	// calculation. However, if the amount of bytes is small but the transaction still took a substantial amount of
+	// time, we keep it, as it is meaningfully telling us that this mirror is shit.
+	if sample.Bytes < minSampleBytes && sample.Duration < maxDurationForMinBytes {
+		log.Debugf(
+			"Dropping sample for %s, not significant enough (%d bytes in %v)",
+			name, sample.Bytes, sample.Duration,
+		)
 		return
 	}
 
@@ -116,12 +119,12 @@ func (s *Stats) Update(name string, sample Sample) {
 	s.workers[name] = w
 }
 
-func (s *Stats) GoodPerformer(name string) bool {
+func (s *Stats) Stats(name string) (float64, bool) {
 	entries := s.workerList()
 
 	if len(entries) <= s.NumTopWorkers {
 		log.Debugf("Less than %d workers ranked, cannot evict any yet", s.NumWorkers)
-		return true
+		return 0, true
 	}
 
 	position := slices.IndexFunc(entries, func(entry namedEntry) bool {
@@ -130,18 +133,19 @@ func (s *Stats) GoodPerformer(name string) bool {
 
 	if position == -1 {
 		log.Debugf("Worker %s is not ranked yet", name)
-		return true
+		return 0, true
 	}
 
 	log.Debugf("Worker %s is in position %d/%d", name, position+1, len(s.workers))
 
-	if entries[position].throughput > s.GoodThroughputMiBs*1024*1024 {
+	throughput := entries[position].throughput
+	if throughput > s.GoodThroughputMiBs*1024*1024 {
 		log.Debugf("Worker %s has an absolutely good throughput", name)
-		return true
+		return throughput, true
 	}
 
-	// We're good performers if we're earlier than the last two positions
-	return position < s.NumTopWorkers
+	// We're good performers if we're among NumTopWorkers.
+	return throughput, position < s.NumTopWorkers
 }
 
 func (s *Stats) report() {

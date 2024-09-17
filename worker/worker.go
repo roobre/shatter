@@ -1,60 +1,113 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"roob.re/refractor/client"
-	"roob.re/refractor/stats"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	"roob.re/refractor/stats"
+)
+
+var (
+	ErrSlowMirror    = errors.New("slow mirror")
+	ErrChannelClosed = errors.New("request channel closed")
+	ErrCode          = errors.New("received non-ok status code")
 )
 
 type Worker struct {
-	Name   string
-	Stats  *stats.Stats
-	Client *client.Client
+	Name    string
+	Mirror  string
+	Timeout time.Duration
+	Stats   *stats.Stats
+	Client  *http.Client
+}
+
+type RequestResponse struct {
+	Request    *http.Request
+	ResponseCh chan ResponseErr
+}
+
+type ResponseErr struct {
+	Response *http.Response
+	Err      error
 }
 
 func (w Worker) String() string {
-	return fmt.Sprintf("%s:%s", w.Name, w.Client.String())
+	return fmt.Sprintf("%s:%s", w.Name, w.Mirror)
 }
 
-func (w Worker) Work(requests chan client.Request) error {
+func (w Worker) Work(requests chan RequestResponse) error {
 	log.Debugf("Starting worker %s", w.String())
 
-	for req := range requests {
-		if !w.Stats.GoodPerformer(w.String()) {
-			go func() {
-				requests <- req
-			}()
-
-			return fmt.Errorf("worker %s is not a good performer, evicting and requeuing request", w.String())
-		}
-
-		log.Infof("Requesting %s:%s", w.Name, w.Client.URL(req.Path))
-
-		start := time.Now()
-		response := w.Client.Do(req)
-		response.Worker = w.String()
-
-		if response.Error != nil {
-			go func() {
-				requests <- req
-			}()
-
-			return fmt.Errorf("worker %s returned error for %s, sacrificing: %v", w.String(), req.Path, response.Error)
-		}
-
-		response.Done = func(written int64) {
-			sample := stats.Sample{
-				Bytes:    written,
-				Duration: time.Since(start),
-			}
-			log.Infof("%s %s:%s", sample.String(), w.Name, w.Client.URL(req.Path))
-			go w.Stats.Update(w.String(), sample)
-		}
-
-		req.ResponseChan <- response
+	client := w.Client
+	if client == nil {
+		client = http.DefaultClient
 	}
 
-	return fmt.Errorf("request channel closed")
+	for req := range requests {
+		response, err := func(*http.Request) (*http.Response, error) {
+			throughput, goodPerformer := w.Stats.Stats(w.Name)
+			if !goodPerformer {
+				return nil, fmt.Errorf("%w: %.2fMiB/s", ErrSlowMirror, throughput/1024/1024)
+			}
+
+			httpReq, err := w.toMirror(req.Request)
+			if err != nil {
+				return nil, err
+			}
+
+			log.Infof("%s %s %s", w.Name, httpReq.Method, httpReq.URL)
+
+			start := time.Now()
+			response, err := client.Do(httpReq)
+			if err != nil {
+				return nil, err
+			}
+
+			if response.StatusCode > 400 {
+				return nil, fmt.Errorf("%w: %d", ErrCode, response.StatusCode)
+			}
+
+			response.Body = &stats.ReaderWrapper{
+				Underlying: response.Body,
+				OnDone: func(written uint64) {
+					sample := stats.Sample{
+						Bytes:    written,
+						Duration: time.Since(start),
+					}
+					log.Debugf("%s: %s", w.Name, sample.String())
+					go w.Stats.Update(w.String(), sample)
+				},
+			}
+
+			return response, nil
+		}(req.Request)
+
+		req.ResponseCh <- ResponseErr{
+			response,
+			err,
+		}
+
+		// In addition to reporting the error to the channel, break request loop as we don't trust this mirror anymore.
+		if err != nil {
+			return err
+		}
+	}
+
+	return ErrChannelClosed
+}
+
+func (w Worker) toMirror(r *http.Request) (*http.Request, error) {
+	newUrl, err := url.Parse(strings.TrimSuffix(w.Mirror, "/") + r.URL.Path)
+	if err != nil {
+		return nil, fmt.Errorf("building url: %w", err)
+	}
+
+	r.URL = newUrl
+	return r, nil
 }

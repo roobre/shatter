@@ -1,10 +1,29 @@
-workers: 8
-goodThroughputMiBs: 10
-peekSizeMiBs: 1
-peekTimeout: 1s
+# Number of workers to start. This controls the amount of parallel chunk downloads.
+# This should be set reasonably higher than the number of pacman parallel downloads.
+#workers: 8
 
-preDownloadTimeout: 500ms
-downloadTimeout: 1m
+# Number of top workers. Mirrors that are ranked below this number in throughput will be rotated out of the pool
+# and replaced with new random mirrors.
+#topWorkers: 4
+
+# Throughput considered "good" regardless of worker rank. Mirrors that are currently transmitting data at a
+# rate higher than this are never rotated out, regardless of their rank.
+# It should be set to a value _smaller_ than `(your ISP bandwidth in MiB/s)/(workers)`.
+#goodThroughputMiBs: 4
+
+# Split package downloads across mirrors in chunks of this size.
+# Total memory requirements of refractor roughly equals (chunkSizeMiBs * workers).
+#chunkSizeMiBs: 4
+
+# Refractor will give up on a mirror when a chunk takes longer than this to transfer the full chunk.
+# Mirror will be immediately evicted, and request retried to another mirror in the pool.
+#chunkTimeout: "5s"
+
+# Retry failed chunk downloads this many times. If the first chunk reaches this amount of failures, refractor will emit
+# a non-OK status code. If this happens to a chunk other than the first, refractor will cancel the request after
+# writing a partial body. As refractor advertised the expected Content-Lenght, HTTP clients should detect this and
+# discard the data that has already been transmitted.
+#retries: 5
 
 provider:
   archlinux:

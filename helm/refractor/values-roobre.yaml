@@ -1,0 +1,21 @@
+image:
+  pullPolicy: Always
+
+config:
+  peekSizeMiBs: 2
+  peekTimeout: 2s
+
+ingress:
+  enabled: true
+  className: internal
+  hosts:
+    - host: refractor.terabox.moe
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+    # Legacy
+    - host: flexo.terabox.moe
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []

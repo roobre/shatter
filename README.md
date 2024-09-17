@@ -1,22 +1,32 @@
 # 🪞 Refractor
 
-Refractor is linux mirror load-balancer, which parallelizes requests between an extremely dynamic pool of mirrors. Mirrors in the pool are constantly monitored for throughput, and slowest mirrors are continuously rotated out of the pool and replaced by new ones.
+Refractor is linux mirror load-balancer, which parallelizes requests between an extremely dynamic pool of mirrors. Mirrors in the pool are constantly monitored for throughput, and slowest mirrors are continuously rotated out of the pool and replaced by new ones obtained at random.
 
 ## Working principle
 
-The core of Refractor is a pool of workers, to which HTTP requests are routed. A worker mapped to a particular mirror performs the request to said mirror and proxies the response to the user.
+The core of Refractor is a pool of workers, to which HTTP requests are routed. A worker draws a random mirror from a list, and proxies the response to the user.
 
-Before considering a request, workers look how well they are performing compared to their peers. If they are on the bottom two positions of the ranking, they will resign and get out of the pool. The pool will automatically add a worker for a different mirror to compensate.
+Refractor aims to work in a stateless, self-balancing way. It tries to achieve this by picking up mirrors from a large list (referred as a Provider), and routing requests to them while measuring how the mirrors perform. If a mirror is among the bottom N performers, it gets rotated out of the pool. Mirrors that fail to complete requests in a given time are also immediately rotated out, while mirrors that perform above a given threshold are never rotated out even if they are among the bottom performers. After a certain amount of requests, this should stabilize in a pool of fast mirrors.
 
-This way, the pool of active mirrors is constantly rotating slow mirrors out of the pool, based on their current performance. This eliminates the need of continuously benchmarking mirrors, and avoids having to assume that mirrors' bandwidth is constant in time.
+In an attempt to maximize downlink and speed up the rotation of slow mirrors, requests are split up in several chunks of a configurable size, typically a few megabytes, that are themselves routed to different mirrors. Chunks are buffered in memory and served to clients in a pipelined fashion. If a mirror returns an error for a chunk, or fails to download the chunk in time, the mirror that failed is immediately rotated out and the chunk is re-queued to another mirror.
 
-## Intended usage
+Mirror throughput is measured using a rolling average, so if a mirror performed well in the past but doesn't anymore, for example because it is currently dealing with a large amount of traffic, it gets rotated out.
 
-Refractor is intended to be run either locally, or in a local network where linux machines reside. This is because Refractor drops mirrors aggressively based on mirror-to-client throughput, and therefore it will not be effective if clients with different effective throughput to the host running Refractor connect to it. Moreover, for this same reason, bad actors could deliberately simulate bad latencies and kick good mirrors out of the pool, degrading service quality for others.
+## Usage
+
+The provided docker image can be run directly with no arguments and it will use the default config (`refractor.yaml`).
+
+```shell
+docker run ghcr.io/roobre/refractor:$VERSION
+```
+
+The default config will spin up Refractor to load-balance across Archlinux mirrors located in western Europe. To serve mirrors from different regions, check out the provider configuration below.
+
+The updated config file can be mounted in the docker container in `/config/refractor.yaml`.
 
 ## Providers
 
-Refractor is designed to be distribution-agnostic, as long as a Provider that can fetch a mirror and feed it to the pool is implemented. Refractor automatically sorts the pool of mirrors automatically by the throughput they provide as request come by. This means that providers do not need to sort or benchmark mirrors before supplying them to the pool.
+Refractor is designed to be distribution-agnostic, as long as a Provider that can fetch a mirror and feed it to the pool is implemented. As refractor automatically keeps fast mirrors and discards slow ones, providers do not need to sort or benchmark mirrors before supplying them to the pool.
 
 It is recommended, however, for providers to apply coarse-grain filter such as physical location, as doing so will allow the pool to stabilize faster.
 
@@ -27,9 +37,6 @@ For the moment, the following providers exist:
 The Arch Linux provider feeds mirrors from `https://archlinux.org/mirrors/status/json/`, after applying some user-defined filters. For now, filtering by country and by score is allowed.
 
 ```yaml
-workers: 8
-goodThroughputMiBs: 10
-
 provider:
   archlinux:
     maxScore: 5
@@ -47,9 +54,6 @@ The Command provider allows to feed to the pool mirror URLs obtained from runnin
 > ⚠️ Refractor rotates mirrors from the pool very aggressively, which means the specified command will be called multiple times and very often. Please make sure this command is not hammering any public API without appropriate caching.
 
 ```yaml
-workers: 8
-goodThroughputMiBs: 10
-
 provider:
   command:
     #shell: /bin/bash # Defaults to $SHELL, then to /bin/sh
@@ -76,12 +80,6 @@ type Provider interface {
 As an example, the Arch Linux mirror provider retrieves the list of mirrors from `https://archlinux.org/mirrors/status/json/`, applies some user-defined country and score settings, and returns a random mirror from the resulting list.
 
 Implementing providers in code is encouraged as it provides maximum flexibility to control caching and configuration options. PRs are welcome!
-
-## Advanced features
-
-- **Average window**: Only the last few throughput measurments are averaged when checking how a mirror is performing. This allow rotating out mirrors that start to behave poorly even if they have been very performant in the past.
-- **Absolutely good throughput**: Mirrors that perform better than `goodThroughputMiBs` will not be rotated from the pool, even if they are the least performant.
-- **Request peeking**: Refractor will "peek" the first few megs (`peekSizeMiBs`) from the connection to a mirror before passing the response to the client. If this peek operation takes too long (`peekTimeout`), the request will be requeued to a different mirror.
 
 ## Trivia
 
